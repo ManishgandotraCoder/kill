@@ -27,10 +27,13 @@ import {
   KlineInterval,
   klineStreamName,
 } from "@/lib/binance/klines";
+import { sequenceKey } from "@/lib/candle-code";
+import { detectMask, patternsIn, type PatternDef } from "@/lib/patterns";
+import type { DiscoveredLite } from "./points";
 
 export const THEMES = {
-  light: { surface: "#fcfcfb", text: "#5f5e5a", grid: "#ecebe8", border: "#d9d8d4", up: "#0ca30c", down: "#d03b3b", forecast: "#2a78d6", point: "#eb6834" },
-  dark: { surface: "#1a1a19", text: "#a3a29d", grid: "#2a2a28", border: "#3a3a37", up: "#0ca30c", down: "#d03b3b", forecast: "#3987e5", point: "#d95926" },
+  light: { surface: "#fcfcfb", text: "#5f5e5a", grid: "#ecebe8", border: "#d9d8d4", up: "#0ca30c", down: "#d03b3b", forecast: "#2a78d6", point: "#eb6834", discovered: "#6250d6" },
+  dark: { surface: "#1a1a19", text: "#a3a29d", grid: "#2a2a28", border: "#3a3a37", up: "#0ca30c", down: "#d03b3b", forecast: "#3987e5", point: "#d95926", discovered: "#9085e9" },
 };
 
 type Theme = (typeof THEMES)["light"];
@@ -83,9 +86,11 @@ interface Props {
   /** When true, clicking a candle calls onPick with its open time (ms). */
   pickMode?: boolean;
   onPick?: (timeMs: number) => void;
+  /** Discovered patterns to mark (1h chart only - they were found on 1h candles). */
+  discovered?: DiscoveredLite[];
 }
 
-export default function CandleChart({ symbol, cone: forecast, markers = [], pickMode = false, onPick }: Props) {
+export default function CandleChart({ symbol, cone: forecast, markers = [], pickMode = false, onPick, discovered = [] }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const coneRef = useRef<ConeSeries | null>(null);
   const markersRef = useRef<{ api: ISeriesMarkersPluginApi<Time>; byTime: Map<number, Candle> } | null>(null);
@@ -97,6 +102,14 @@ export default function CandleChart({ symbol, cone: forecast, markers = [], pick
   const [last, setLast] = useState<Candle | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadedKey, setLoadedKey] = useState("");
+  const [closedTick, setClosedTick] = useState(0);
+  const [showPatterns, setShowPatterns] = useState(true);
+  const [showDiscovered, setShowDiscovered] = useState(true);
+  const [hoverPatterns, setHoverPatterns] = useState<PatternDef[]>([]);
+  const [hoverDiscovered, setHoverDiscovered] = useState<DiscoveredLite[]>([]);
+  const discoveredAtRef = useRef(new Map<number, DiscoveredLite[]>());
+  /** Patterns completed at each bar (time in seconds), for the hover readout. */
+  const patternsAtRef = useRef(new Map<number, PatternDef[]>());
 
   useEffect(() => {
     pickRef.current = { pickMode, onPick };
@@ -165,11 +178,13 @@ export default function CandleChart({ symbol, cone: forecast, markers = [], pick
 
     const push = (c: Candle) => {
       if (latest && c.time < latest.time) return; // series.update only accepts the newest bar
+      const closedNow = c.closed && !byTime.get(c.time)?.closed;
       byTime.set(c.time, c);
       candles.update(toBar(c));
       volume.update(toVolume(c, theme));
       latest = c;
       setLast(c);
+      if (closedNow) setClosedTick((x) => x + 1); // a candle finished: re-scan patterns
     };
 
     // Subscribe first, buffer until history arrives so no candle update is lost.
@@ -227,6 +242,8 @@ export default function CandleChart({ symbol, cone: forecast, markers = [], pick
 
     const onMove = (p: MouseEventParams) => {
       setHover(p.time !== undefined ? (byTime.get(p.time as number) ?? null) : null);
+      setHoverPatterns(p.time !== undefined ? (patternsAtRef.current.get(p.time as number) ?? []) : []);
+      setHoverDiscovered(p.time !== undefined ? (discoveredAtRef.current.get(p.time as number) ?? []) : []);
     };
     chart.subscribeCrosshairMove(onMove);
 
@@ -302,51 +319,130 @@ export default function CandleChart({ symbol, cone: forecast, markers = [], pick
     if (!m) return;
     const step = BAR_SECONDS[interval];
     const theme = currentTheme();
-    m.api.setMarkers(
-      markers
-        .map((p) => ({ ...p, time: Math.floor(p.hourTs / 1000 / step) * step }))
-        .filter((p) => m.byTime.has(p.time))
-        .sort((a, b) => a.time - b.time)
-        .map((p) => ({
-          time: p.time as UTCTimestamp,
-          position: "aboveBar" as const,
-          shape: p.selected ? ("arrowDown" as const) : ("circle" as const),
-          color: p.selected ? theme.forecast : theme.point,
-          text: p.label,
-          size: p.selected ? 1.4 : 1,
-        })),
-    );
-  }, [markers, interval, loadedKey]);
+    const pointMarkers = markers
+      .map((p) => ({ ...p, time: Math.floor(p.hourTs / 1000 / step) * step }))
+      .filter((p) => m.byTime.has(p.time))
+      .map((p) => ({
+        time: p.time as UTCTimestamp,
+        position: "aboveBar" as const,
+        shape: p.selected ? ("arrowDown" as const) : ("circle" as const),
+        color: p.selected ? theme.forecast : theme.point,
+        text: p.label,
+        size: p.selected ? 1.4 : 1,
+      }));
+
+    // Candlestick patterns on the closed candles currently loaded.
+    const closed = [...m.byTime.values()].filter((c) => c.closed).sort((a, b) => a.time - b.time);
+    const ohlc = closed.map((c) => ({ o: c.open, h: c.high, l: c.low, c: c.close }));
+    const at = new Map<number, PatternDef[]>();
+    closed.forEach((c, i) => {
+      const found = patternsIn(detectMask(ohlc, i));
+      if (found.length) at.set(c.time, found);
+    });
+    patternsAtRef.current = at;
+    const patternMarkers = showPatterns
+      ? [...at].flatMap(([time, found]) => {
+          // Doji / spinning top are everywhere; keep markers for directional patterns.
+          const shown = found.filter((p) => p.textbook !== "neutral");
+          if (!shown.length) return [];
+          const ups = shown.filter((p) => p.textbook === "up");
+          const downs = shown.filter((p) => p.textbook === "down");
+          return [
+            ...(ups.length ? [{ time: time as UTCTimestamp, position: "belowBar" as const, shape: "arrowUp" as const, color: theme.up, text: ups.map((p) => p.code).join(" "), size: 0.7 }] : []),
+            ...(downs.length ? [{ time: time as UTCTimestamp, position: "aboveBar" as const, shape: "arrowDown" as const, color: theme.down, text: downs.map((p) => p.code).join(" "), size: 0.7 }] : []),
+          ];
+        })
+      : [];
+
+    // Discovered sequences (found on 1h candles, so only marked on the 1h chart).
+    const byKey = new Map(discovered.map((d) => [d.key, d]));
+    const found = new Map<number, DiscoveredLite[]>();
+    if (interval === "1h" && byKey.size) {
+      closed.forEach((c, i) => {
+        const hits: DiscoveredLite[] = [];
+        for (let len = 1; len <= 3; len++) {
+          const key = sequenceKey(ohlc, i, len);
+          const hit = key && byKey.get(key);
+          if (hit) hits.push(hit);
+        }
+        if (hits.length) found.set(c.time, hits);
+      });
+    }
+    discoveredAtRef.current = found;
+    const discoveredMarkers = showDiscovered
+      ? [...found].map(([time, hits]) => ({
+          time: time as UTCTimestamp,
+          position: hits[0].direction === "up" ? ("belowBar" as const) : ("aboveBar" as const),
+          shape: "circle" as const,
+          color: theme.discovered,
+          text: hits.map((h) => `★${h.id}`).join(" "),
+          size: 0.7,
+        }))
+      : [];
+
+    m.api.setMarkers([...pointMarkers, ...patternMarkers, ...discoveredMarkers].sort((a, b) => (a.time as number) - (b.time as number)));
+  }, [markers, interval, loadedKey, closedTick, showPatterns, showDiscovered, discovered]);
 
   const shown = hover ?? last;
 
   return (
-    <section className="mb-8">
-      <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-2">
-        <div className="flex gap-1" role="group" aria-label="Candle interval">
+    <div>
+      <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+        <div className="flex gap-0.5 rounded-lg bg-panel-2 p-0.5" role="group" aria-label="Candle interval">
           {KLINE_INTERVALS.map((i) => (
             <button
               key={i}
               onClick={() => setTimeframe(i)}
               aria-pressed={i === interval}
-              className={`rounded px-2 py-0.5 ${
-                i === interval
-                  ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-black"
-                  : "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+              className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                i === interval ? "bg-panel text-foreground shadow-sm" : "text-muted hover:text-foreground"
               }`}
             >
               {i}
             </button>
           ))}
         </div>
+        <button
+          onClick={() => setShowPatterns(!showPatterns)}
+          aria-pressed={showPatterns}
+          className={`rounded-lg px-2.5 py-1 text-xs font-medium transition-colors ${showPatterns ? "bg-foreground text-background" : "bg-panel-2 text-muted hover:text-foreground"}`}
+          title="Mark the 20 classic candlestick patterns"
+        >
+          Classic
+        </button>
+        <button
+          onClick={() => setShowDiscovered(!showDiscovered)}
+          aria-pressed={showDiscovered}
+          disabled={interval !== "1h"}
+          className={`-ml-2 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors disabled:opacity-40 ${showDiscovered ? "bg-[#6250d6] text-white dark:bg-[#9085e9] dark:text-black" : "bg-panel-2 text-muted hover:text-foreground"}`}
+          title={interval === "1h" ? "Mark patterns the app discovered in 5 years of data" : "Discovered patterns are found on 1h candles - switch to 1h"}
+        >
+          ★ Discovered
+        </button>
         {shown && <OhlcReadout c={shown} />}
+        {hover && hoverDiscovered.length > 0 && (
+          <span className="text-xs text-[#6250d6] dark:text-[#9085e9]">
+            {hoverDiscovered.map((d) => (
+              <span key={d.id} className="mr-2">
+                ★{d.id} {d.direction === "up" ? "▲" : "▼"} {d.description}
+              </span>
+            ))}
+          </span>
+        )}
+        {hover && hoverPatterns.length > 0 && (
+          <span className="text-xs">
+            {hoverPatterns.map((p) => (
+              <span key={p.id} className={`mr-2 ${p.textbook === "up" ? "text-up" : p.textbook === "down" ? "text-down" : "text-muted"}`}>
+                {p.textbook === "up" ? "▲" : p.textbook === "down" ? "▼" : "↔"} {p.name}
+              </span>
+            ))}
+          </span>
+        )}
       </div>
       <div className="relative">
         <div
           ref={containerRef}
-          className={`h-[420px] w-full overflow-hidden rounded border ${
-            pickMode ? "cursor-crosshair border-[#eb6834] dark:border-[#d95926]" : "border-zinc-200 dark:border-zinc-800"
-          }`}
+          className={`h-[460px] w-full overflow-hidden rounded-lg border ${pickMode ? "cursor-crosshair border-point" : "border-line"}`}
         />
         {pickMode && (
           <span className="pointer-events-none absolute top-2 left-1/2 z-10 -translate-x-1/2 rounded bg-[#eb6834] px-2 py-0.5 text-xs text-white dark:bg-[#d95926]">
@@ -365,7 +461,7 @@ export default function CandleChart({ symbol, cone: forecast, markers = [], pick
         </div>
       </div>
       {error && <p className="mt-2 text-rose-600">{error}</p>}
-    </section>
+    </div>
   );
 }
 

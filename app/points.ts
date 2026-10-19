@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import type { Explanation } from "@/lib/predict";
 
 export const HOUR_MS = 3_600_000;
@@ -74,12 +74,13 @@ export function clearPoints(symbol: string) {
 
 const cache = new Map<string, Promise<Explanation>>();
 
-function fetchExplanation(symbol: string, hourTs: number | null, version: string): Promise<Explanation> {
-  const key = `${symbol}:${hourTs ?? "now"}:${version}`;
+function fetchExplanation(symbol: string, hourTs: number | null, version: string, modelFrom?: number): Promise<Explanation> {
+  const key = `${symbol}:${hourTs ?? "now"}:${version}:${modelFrom ?? ""}`;
   let p = cache.get(key);
   if (!p) {
     const q = new URLSearchParams({ symbol });
     if (hourTs !== null) q.set("at", String(hourTs));
+    if (modelFrom !== undefined) q.set("modelFrom", String(modelFrom));
     p = fetch(`/api/explain?${q}`, { cache: "no-store" }).then(async (res) => {
       if (!res.ok) throw new Error(await res.text());
       return res.json() as Promise<Explanation>;
@@ -99,22 +100,25 @@ function versionFor(hourTs: number | null, version: string): string {
   return hourTs === null || !current || hourTs >= current ? version : "closed";
 }
 
-/** Explanation for the hour `hourTs` (null = the current hour). `version` = current hour's open time. */
-export function useExplanation(symbol: string, hourTs: number | null, version: string) {
+/**
+ * Explanation for the hour `hourTs` (null = the current hour). `version` = current
+ * hour's open time. `modelFrom` = a run's start, to explain with that run's frozen model.
+ */
+export function useExplanation(symbol: string, hourTs: number | null, version: string, modelFrom?: number) {
   const v = versionFor(hourTs, version);
-  const key = `${symbol}:${hourTs ?? "now"}:${v}`;
+  const key = `${symbol}:${hourTs ?? "now"}:${v}:${modelFrom ?? ""}`;
   const [state, setState] = useState<{ key: string; data: Explanation | null; error: string | null } | null>(null);
 
   useEffect(() => {
     let alive = true;
-    fetchExplanation(symbol, hourTs, v).then(
+    fetchExplanation(symbol, hourTs, v, modelFrom).then(
       (data) => alive && setState({ key, data, error: null }),
       (e) => alive && setState({ key, data: null, error: e instanceof Error ? e.message : String(e) }),
     );
     return () => {
       alive = false;
     };
-  }, [symbol, hourTs, v, key]);
+  }, [symbol, hourTs, v, key, modelFrom]);
 
   return state?.key === key ? state : { key, data: null, error: null };
 }
@@ -152,29 +156,22 @@ export function useExplanationList(symbol: string, hours: number[], version: str
   return state?.key === key ? state.map : new Map();
 }
 
-// ---- saved predictions (DB, via /api/predictions) -------------------------
+// ---- prediction runs (DB, via /api/runs) ---------------------------------
 
-export interface SavedPrediction {
-  symbol: string;
-  targetTs: number;
-  source: string; // "auto", "manual" or "auto + manual"
-  base: number;
-  predicted: number;
-  lower: number;
-  upper: number;
-  actual: number | null;
-}
+export type { Run, RunPrediction } from "@/lib/runs";
+import type { Run } from "@/lib/runs";
 
-/** Every prediction stored for `symbol`, newest first; refreshes every minute. */
-export function useSavedPredictions(symbol: string, version: string) {
-  const [state, setState] = useState<{ symbol: string; rows: SavedPrediction[] } | null>(null);
+/** Runs for `symbol`, newest first. Refreshes every minute and when `version` changes; `reload` after edits. */
+export function useRuns(symbol: string, version: string) {
+  const [state, setState] = useState<{ symbol: string; runs: Run[] } | null>(null);
   const [tick, setTick] = useState(0);
+  const reload = useCallback(() => setTick((t) => t + 1), []);
 
   useEffect(() => {
     const ctrl = new AbortController();
-    fetch(`/api/predictions?symbol=${symbol}`, { signal: ctrl.signal, cache: "no-store" })
+    fetch(`/api/runs?symbol=${symbol}`, { signal: ctrl.signal, cache: "no-store" })
       .then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
-      .then((d: { rows: SavedPrediction[] }) => setState({ symbol, rows: d.rows }))
+      .then((runs: Run[]) => setState({ symbol, runs }))
       .catch(() => {});
     const timer = setTimeout(() => setTick((t) => t + 1), 60_000);
     return () => {
@@ -183,8 +180,34 @@ export function useSavedPredictions(symbol: string, version: string) {
     };
   }, [symbol, version, tick]);
 
-  return state?.symbol === symbol ? state.rows : null;
+  return { runs: state?.symbol === symbol ? state.runs : null, reload };
 }
+
+// ---- discovered patterns (for chart markers) ------------------------------
+
+export interface DiscoveredLite {
+  id: string;
+  key: string;
+  direction: "up" | "down";
+  description: string;
+}
+
+/** Confirmed + weak discovered patterns for a symbol. */
+export function useDiscovered(symbol: string): DiscoveredLite[] {
+  const [state, setState] = useState<{ symbol: string; list: DiscoveredLite[] } | null>(null);
+  useEffect(() => {
+    const ctrl = new AbortController();
+    fetch(`/api/discovered?symbol=${symbol}`, { signal: ctrl.signal, cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then((d: { patterns: (DiscoveredLite & { tier: string })[] }) =>
+        setState({ symbol, list: d.patterns.filter((p) => p.tier !== "failed").map(({ id, key, direction, description }) => ({ id, key, direction, description })) }),
+      )
+      .catch(() => {});
+    return () => ctrl.abort();
+  }, [symbol]);
+  return state?.symbol === symbol ? state.list : EMPTY_DISCOVERED;
+}
+const EMPTY_DISCOVERED: DiscoveredLite[] = [];
 
 // ---- formatting -----------------------------------------------------------
 

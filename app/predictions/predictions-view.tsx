@@ -1,161 +1,152 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useState } from "react";
-import type { PredictionRow, PredictionSummary } from "../api/predictions/route";
+import type { Run, RunPrediction } from "@/lib/runs";
 
-const HOUR_MS = 3_600_000;
-const SOURCES = [
-  { value: "", label: "All" },
-  { value: "manual", label: "Saved by me" },
-  { value: "auto", label: "Hourly auto" },
-];
 
-interface Data {
-  summary: PredictionSummary;
-  rows: PredictionRow[];
-  symbols: string[];
-}
-
+/** Results of the prediction runs created in the live page's left sidebar. */
 export default function PredictionsView() {
-  const [symbol, setSymbol] = useState("");
-  const [source, setSource] = useState("manual");
-  const [result, setResult] = useState<{ key: string; data: Data | null; error: string | null } | null>(null);
+  const [symbol, setSymbol] = useState("BTCUSDT");
+  const [symbols, setSymbols] = useState<string[]>(["BTCUSDT"]);
+  const [runId, setRunId] = useState<number | null>(null);
+  const [result, setResult] = useState<{ symbol: string; runs: Run[] | null; error: string | null } | null>(null);
   const [tick, setTick] = useState(0);
-  const key = `${symbol}:${source}:${tick}`;
+
+  useEffect(() => {
+    fetch("/api/candles", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((d: { symbols: { symbol: string }[] }) => setSymbols(d.symbols.map((x) => x.symbol)))
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     const ctrl = new AbortController();
-    const q = new URLSearchParams({ symbol, source });
-    fetch(`/api/predictions?${q}`, { signal: ctrl.signal, cache: "no-store" })
+    fetch(`/api/runs?symbol=${symbol}`, { signal: ctrl.signal, cache: "no-store" })
       .then(async (res) => {
         if (!res.ok) throw new Error(await res.text());
-        setResult({ key, data: await res.json(), error: null });
+        setResult({ symbol, runs: await res.json(), error: null });
       })
-      .catch((e) => !ctrl.signal.aborted && setResult({ key, data: null, error: String(e) }));
-    // Refresh every minute so pending predictions flip to right/wrong when their hour closes.
+      .catch((e) => !ctrl.signal.aborted && setResult({ symbol, runs: null, error: String(e) }));
+    // Refresh every minute so pending hours flip to right/wrong when they close.
     const timer = setTimeout(() => setTick((t) => t + 1), 60_000);
     return () => {
       ctrl.abort();
       clearTimeout(timer);
     };
-  }, [symbol, source, key]);
+  }, [symbol, tick]);
 
-  // Keep showing the previous data while a refresh loads.
-  const data = result?.data;
-  const s = data?.summary;
-  const resolved = s ? s.right + s.wrong : 0;
+  const runs = result?.symbol === symbol ? result.runs : null;
+  const run = runs?.find((r) => r.id === runId) ?? runs?.[0] ?? null;
+  const rows = run ? [...run.predictions].reverse() : [];
+  const done = rows.filter((r) => r.actual != null);
+  const right = done.filter((r) => Math.sign(r.predicted - r.base) === Math.sign(r.actual! - r.base)).length;
+  const inRange = done.filter((r) => r.actual! >= r.lower && r.actual! <= r.upper).length;
+  const avgMiss = done.length ? done.reduce((a, r) => a + Math.abs(r.actual! - r.predicted) / r.actual!, 0) / done.length * 100 : null;
 
   return (
-    <main className="mx-auto w-full max-w-5xl px-4 py-8 font-mono text-sm">
-      <nav className="mb-6 flex flex-wrap items-center gap-4 text-zinc-500">
-        <Link href="/" className="hover:text-foreground">← Live</Link>
-        <h1 className="text-base font-semibold text-foreground">Prediction results</h1>
-        <Link href="/history" className="ml-auto hover:text-foreground">History (DB) →</Link>
-      </nav>
-
-      <section className="mb-6 flex flex-wrap items-center gap-3">
-        <select
-          value={symbol}
-          onChange={(e) => setSymbol(e.target.value)}
-          aria-label="Symbol"
-          className="rounded border border-zinc-300 bg-transparent px-2 py-1 dark:border-zinc-700"
-        >
-          <option value="">All symbols</option>
-          {data?.symbols.map((sym) => <option key={sym}>{sym}</option>)}
-        </select>
-        <div className="flex gap-1" role="group" aria-label="Which predictions">
-          {SOURCES.map((o) => (
+    <main className="mx-auto w-full max-w-5xl px-4 py-6 text-sm">
+      <div className="mb-5 flex flex-wrap items-end gap-3">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">Prediction runs</h1>
+          <p className="text-muted">Create runs in the left sidebar of the Live page: pick a start and end time, and every 1-hour candle in between is predicted.</p>
+        </div>
+        <div className="ml-auto flex gap-2">
+          {symbols.map((x) => (
             <button
-              key={o.value}
-              onClick={() => setSource(o.value)}
-              aria-pressed={o.value === source}
-              className={`rounded px-2 py-0.5 ${
-                o.value === source
-                  ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-black"
-                  : "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-              }`}
+              key={x}
+              onClick={() => {
+                setSymbol(x);
+                setRunId(null);
+              }}
+              className={`rounded-full px-3 py-1 text-xs font-medium ${x === symbol ? "bg-foreground text-background" : "bg-panel-2 text-muted hover:text-foreground"}`}
             >
-              {o.label}
+              {x}
             </button>
           ))}
         </div>
-      </section>
+      </div>
 
-      {result?.error && <p className="mb-4 text-rose-600">{result.error}</p>}
+      {result?.error && <p className="card mb-4 p-4 text-rose-600">{result.error}</p>}
+      {runs && runs.length === 0 && <p className="card p-6 text-center text-muted">No runs yet for {symbol}. Create one in the left sidebar of the Live page.</p>}
 
-      {s && (
+      {runs && runs.length > 0 && (
+        <div className="mb-5 flex flex-wrap gap-2">
+          {runs.map((r) => (
+            <button
+              key={r.id}
+              onClick={() => setRunId(r.id)}
+              className={`rounded-lg border px-3 py-1.5 text-left text-xs ${r.id === run?.id ? "border-accent bg-accent/10" : "border-line bg-panel hover:bg-panel-2"}`}
+            >
+              <div className="font-medium">Run #{r.id} · {r.status}</div>
+              <div className="text-muted">{span(r.startTs, r.endTs)}</div>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {run && (
         <>
           <section className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <Tile label="Direction right" value={s.right} sub={pct(s.right, resolved)} tone="good" icon="✓" />
-            <Tile label="Direction wrong" value={s.wrong} sub={pct(s.wrong, resolved)} tone="bad" icon="✗" />
-            <Tile label="Inside 80% range" value={s.inRange} sub={`${pct(s.inRange, resolved)} · ${s.outRange} outside`} />
+            <Tile label="Direction right" value={right} sub={pct(right, done.length)} tone="good" icon="✓" />
+            <Tile label="Direction wrong" value={done.length - right} sub={pct(done.length - right, done.length)} tone="bad" icon="✗" />
+            <Tile label="Inside 80% range" value={inRange} sub={`${pct(inRange, done.length)} · ${done.length - inRange} outside`} />
             <Tile
-              label="Waiting for result"
-              value={s.pending}
-              sub={s.avgErrorPct != null ? `avg price miss ${Number(s.avgErrorPct).toFixed(3)}%` : "—"}
+              label="Still to come"
+              value={Math.max(1, Math.floor(run.hours)) - done.length}
+              sub={avgMiss != null ? `avg price miss ${avgMiss.toFixed(3)}%` : "—"}
             />
           </section>
+          {done.length > 0 && <RightWrongBar right={right} wrong={done.length - right} />}
 
-          {resolved > 0 && <RightWrongBar right={s.right} wrong={s.wrong} />}
-        </>
-      )}
-
-      {data && data.rows.length === 0 && (
-        <p className="rounded border border-dashed border-zinc-300 p-6 text-center text-zinc-500 dark:border-zinc-700">
-          {source === "manual" ? (
-            <>
-              No saved predictions yet. Press <b className="font-normal text-foreground">Save prediction</b> on the{" "}
-              <Link href="/" className="underline">live page</Link>; the result shows here when that hour closes.
-            </>
+          {rows.length === 0 ? (
+            <p className="card p-6 text-center text-muted">This run starts {new Date(run.startTs).toLocaleString()}. Predictions appear as each hour begins.</p>
           ) : (
-            "No predictions yet."
+            <div className="card overflow-x-auto p-2">
+              <table className="w-full min-w-[760px] text-left text-xs [&_td]:px-2 [&_td]:whitespace-nowrap [&_th]:px-2 [&_th]:whitespace-nowrap">
+                <thead className="text-zinc-500">
+                  <tr>
+                    <th className="py-2 font-normal">Hour</th>
+                    <th className="py-2 text-right font-normal">Start</th>
+                    <th className="py-2 text-right font-normal">Predicted</th>
+                    <th className="py-2 text-right font-normal">Actual</th>
+                    <th className="py-2 pl-4 font-normal">Direction</th>
+                    <th className="py-2 font-normal">80% range</th>
+                    <th className="py-2 text-right font-normal">Miss</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <Row key={r.targetTs} r={r} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
-        </p>
-      )}
-
-      {data && data.rows.length > 0 && (
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[860px] text-left text-xs [&_td]:px-2 [&_th]:px-2 [&_td]:whitespace-nowrap [&_th]:whitespace-nowrap">
-            <thead className="text-zinc-500">
-              <tr>
-                <th className="py-2 font-normal">Hour</th>
-                <th className="py-2 font-normal">Symbol</th>
-                <th className="py-2 text-right font-normal">Start</th>
-                <th className="py-2 text-right font-normal">Predicted</th>
-                <th className="py-2 text-right font-normal">Actual</th>
-                <th className="py-2 pl-4 font-normal">Direction</th>
-                <th className="py-2 font-normal">80% range</th>
-                <th className="py-2 text-right font-normal">Miss</th>
-                <th className="py-2 pl-4 font-normal">Saved by</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.rows.map((r) => (
-                <Row key={`${r.symbol}:${r.targetTs}`} r={r} />
-              ))}
-            </tbody>
-          </table>
-        </div>
+        </>
       )}
     </main>
   );
 }
 
-function Row({ r }: { r: PredictionRow }) {
+function span(a: number, b: number): string {
+  const d = (ms: number) => new Date(ms).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+  const min = Math.round((b - a) / 60_000);
+  return `${d(a)} → ${d(b)} · ${min < 60 ? `${min}m` : `${min / 60}h`}`;
+}
+
+function Row({ r }: { r: RunPrediction }) {
   const predPct = ((r.predicted - r.base) / r.base) * 100;
   const actPct = r.actual != null ? ((r.actual - r.base) / r.base) * 100 : null;
   const dirRight = r.actual != null ? Math.sign(r.predicted - r.base) === Math.sign(r.actual - r.base) : null;
   const inRange = r.actual != null ? r.actual >= r.lower && r.actual <= r.upper : null;
   const start = new Date(r.targetTs);
-  const end = new Date(r.targetTs + HOUR_MS);
+  const end = new Date(r.targetTs + r.minutes * 60_000);
 
   return (
     <tr className="border-t border-zinc-200 dark:border-zinc-800">
       <td className="py-2 whitespace-nowrap">
         {start.toLocaleDateString(undefined, { day: "numeric", month: "short" })} {hm(start)}–{hm(end)}
       </td>
-      <td className="py-2">{r.symbol}</td>
       <td className="py-2 text-right">{fmt(r.base)}</td>
       <td className="py-2 text-right whitespace-nowrap">
         {fmt(r.predicted)} <Change pct={predPct} />
@@ -181,7 +172,6 @@ function Row({ r }: { r: PredictionRow }) {
       <td className="py-2 text-right">
         {r.actual != null ? `${((Math.abs(r.actual - r.predicted) / r.actual) * 100).toFixed(3)}%` : ""}
       </td>
-      <td className="py-2 pl-4 text-zinc-500">{r.source.replace("manual", "me").replace("auto", "hourly")}</td>
     </tr>
   );
 }

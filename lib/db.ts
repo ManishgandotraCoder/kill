@@ -24,7 +24,17 @@ CREATE TABLE IF NOT EXISTS candles (
 ALTER TABLE candles ADD COLUMN IF NOT EXISTS time TIMESTAMPTZ
   GENERATED ALWAYS AS (to_timestamp(ts / 1000.0)) STORED;
 
--- One row per next-hour forecast; actual_close is filled once that hour closes.
+-- A prediction run: predict every 1h candle from start_ts (first candle open)
+-- to end_ts (last candle close), with the model frozen at start_ts.
+CREATE TABLE IF NOT EXISTS prediction_runs (
+  id         SERIAL      PRIMARY KEY,
+  symbol     TEXT        NOT NULL REFERENCES symbols(symbol),
+  start_ts   BIGINT      NOT NULL,
+  end_ts     BIGINT      NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per predicted hour; actual_close is filled once that hour closes.
 CREATE TABLE IF NOT EXISTS predictions (
   symbol          TEXT        NOT NULL REFERENCES symbols(symbol),
   target_ts       BIGINT      NOT NULL,  -- open time of the predicted 1h candle, ms UTC
@@ -35,12 +45,16 @@ CREATE TABLE IF NOT EXISTS predictions (
   upper           NUMERIC     NOT NULL,
   actual_close    NUMERIC,
   made_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-  source          TEXT        NOT NULL DEFAULT 'auto',  -- 'auto' (hourly job) or 'manual' (Save button)
+  source          TEXT        NOT NULL DEFAULT 'auto',  -- 'run:<id>'
+  run_id          INT         REFERENCES prediction_runs(id) ON DELETE CASCADE,
   PRIMARY KEY (symbol, target_ts, source)
 );
 
 -- Upgrade tables created before the source column existed.
 ALTER TABLE predictions ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'auto';
+ALTER TABLE predictions ADD COLUMN IF NOT EXISTS run_id INT REFERENCES prediction_runs(id) ON DELETE CASCADE;
+-- Minutes from target_ts the prediction covers: 60 = one 1h candle, less = a short run (price at the end).
+ALTER TABLE predictions ADD COLUMN IF NOT EXISTS horizon_min INT NOT NULL DEFAULT 60;
 DO $$ BEGIN
   IF (SELECT array_length(conkey, 1) FROM pg_constraint WHERE conname = 'predictions_pkey') = 2 THEN
     ALTER TABLE predictions DROP CONSTRAINT predictions_pkey;

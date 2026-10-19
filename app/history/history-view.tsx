@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import type { SyncProgress } from "@/lib/syncCandles";
 import HistoryChart from "./history-chart";
@@ -101,10 +100,7 @@ export default function HistoryView() {
 
   return (
     <main className="mx-auto w-full max-w-5xl px-4 py-8 font-mono text-sm">
-      <nav className="mb-6 flex items-center gap-4 text-zinc-500">
-        <Link href="/" className="hover:text-foreground">← Live</Link>
-        <h1 className="text-base font-semibold text-foreground">Price history (DB)</h1>
-      </nav>
+      <h1 className="mb-6 text-base font-semibold">Price history (DB)</h1>
 
       <section className="mb-4 flex flex-wrap items-center gap-3">
         <select

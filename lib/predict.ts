@@ -16,13 +16,15 @@
 // accuracy near 50%. The volatility band is the part that carries real signal.
 
 import { ensureSchema, pool } from "./db";
+import { type Discovered, discoveredAt } from "./discover";
+import { type Direction, detectMask, type PatternGroup, PATTERNS } from "./patterns";
 import { startSync } from "./syncCandles";
 
 const HOUR_MS = 3_600_000;
 const LOOKBACK = 168; // features need one week of history
 const MIN_TRAIN = 2000; // hours of history needed before a point can be predicted
 const LAMBDA_EWMA = 0.94;
-const RIDGE = 10;
+const RIDGE = 5000; // strong shrinkage: 39 features, many rare pattern flags (chosen by backtest)
 const BAND = 0.8;
 const PATTERN = 12; // candles compared when matching patterns
 const NEIGHBOURS = 50;
@@ -58,9 +60,8 @@ export interface Forecast {
     naiveMaePct: number; // same for "price won't change"
     bandCoverage: number; // % of test hours that closed inside the 80% band
   };
+  /** Record of all prediction-run hours that have closed. */
   live: { count: number; directionAccuracy: number | null; bandCoverage: number | null };
-  /** Whether this hour's forecast was saved with the Save button. */
-  savedManually: boolean;
 }
 
 /** [openTime ms, open, high, low, close] */
@@ -84,6 +85,10 @@ export interface Explanation {
   /** Sorted by size of effect. */
   drivers: { label: string; detail: string; learned: string; contributionPct: number }[];
   volatility: { recentPct: number; hourFactor: number; z: number; rangePct: number };
+  /** Candlestick patterns completed on the last closed candle, with their track record before this hour. */
+  candlePatterns: { baselineUpPct: number; detected: PatternInfo[] };
+  /** Discovered (data-mined, validated) patterns ending on the last closed candle. Found with all stored data. */
+  discovered: Discovered[];
   pattern: MiniCandle[];
   similar: {
     matches: {
@@ -97,6 +102,26 @@ export interface Explanation {
   };
 }
 
+export interface PatternStats {
+  count: number;
+  upPct: number; // % of times the next hour closed higher
+  avgPct: number; // average next-hour move
+  z: number; // how far upPct is from an ordinary hour, in standard errors
+  verdict: "up" | "down" | "none" | "rare"; // what history says (|z| >= 2 counts)
+}
+
+export interface PatternInfo {
+  id: string;
+  name: string;
+  group: PatternGroup;
+  textbook: Direction;
+  candles: number;
+  description: string;
+  stats: PatternStats;
+  /** Push on this forecast from the pattern's model feature, in %. */
+  contributionPct: number;
+}
+
 export class ForecastError extends Error {}
 
 // ---- features -------------------------------------------------------------
@@ -104,7 +129,7 @@ export class ForecastError extends Error {}
 const lr = (a: number, b: number) => Math.log(a / b);
 
 /** Features known at the close of bar t, for predicting bar t+1. */
-function features(bars: Bar[], t: number, sigma: number): number[] {
+function features(bars: Bar[], t: number, sigma: number, mask: number): number[] {
   const c = (k: number) => bars[t - k].c;
   const b = bars[t];
   let sma24 = 0;
@@ -141,8 +166,13 @@ function features(bars: Bar[], t: number, sigma: number): number[] {
     Math.cos(hour),
     Math.sin(dow),
     Math.cos(dow),
+    // 19+: one flag per candlestick pattern completed on this candle
+    ...PATTERNS.map((_, i) => (mask & (1 << i) ? 1 : 0)),
   ];
 }
+
+/** Index of the first pattern flag in the feature vector. */
+const PATTERN_FEATURE = 19;
 
 const pctTxt = (logRet: number, digits = 2) => {
   const p = (Math.exp(logRet) - 1) * 100;
@@ -186,7 +216,7 @@ const FEATURE_TEXT: { label: string; detail: (v: number) => string; up: string; 
 
 // ---- per-symbol series cache (bars + precomputed features) ----------------
 
-interface Series {
+export interface Series {
   symbol: string;
   bars: Bar[];
   /** EWMA volatility known at the close of bar t (NaN for the first hours). */
@@ -195,6 +225,12 @@ interface Series {
   X: (number[] | null)[];
   /** gaps[i] = number of missing hours between bars[0] and bars[i]. */
   gaps: Int32Array;
+  /** Candlestick patterns completed at bar t (bitmask over PATTERNS). */
+  masks: Int32Array;
+  /** Per pattern: bar indices where it occurred (with a gap-free next hour) and running up-count / return sums. */
+  occ: { t: Int32Array; cumUp: Int32Array; cumRet: Float64Array }[];
+  /** Same running sums over every hour, for the baseline. */
+  allCumUp: Int32Array;
 }
 
 const g = globalThis as unknown as {
@@ -236,9 +272,27 @@ async function loadSeries(symbol: string): Promise<Series> {
       sigma[t] = Math.sqrt(v);
     }
   }
-  const X = bars.map((_, t) => (t >= LOOKBACK ? features(bars, t, sigma[t]) : null));
+  const masks = new Int32Array(n);
+  for (let t = 0; t < n; t++) masks[t] = detectMask(bars, t);
+  const X = bars.map((_, t) => (t >= LOOKBACK ? features(bars, t, sigma[t], masks[t]) : null));
 
-  const series: Series = { symbol, bars, sigma, X, gaps };
+  const nextOk = (t: number) => t + 1 < n && gaps[t + 1] === gaps[t];
+  const occ = PATTERNS.map((_, i) => {
+    const ts: number[] = [];
+    for (let t = 0; t < n; t++) if (masks[t] & (1 << i) && nextOk(t)) ts.push(t);
+    const cumUp = new Int32Array(ts.length);
+    const cumRet = new Float64Array(ts.length);
+    ts.forEach((t, j) => {
+      const r = bars[t + 1].c / bars[t].c - 1;
+      cumUp[j] = (j ? cumUp[j - 1] : 0) + (r > 0 ? 1 : 0);
+      cumRet[j] = (j ? cumRet[j - 1] : 0) + r;
+    });
+    return { t: Int32Array.from(ts), cumUp, cumRet };
+  });
+  const allCumUp = new Int32Array(n);
+  for (let t = 0; t < n; t++) allCumUp[t] = (t ? allCumUp[t - 1] : 0) + (nextOk(t) && bars[t + 1].c > bars[t].c ? 1 : 0);
+
+  const series: Series = { symbol, bars, sigma, X, gaps, masks, occ, allCumUp };
   seriesCache.set(symbol, series);
   return series;
 }
@@ -364,7 +418,7 @@ function evaluate(m: Model, d: Dataset) {
 }
 
 /** Model trained only on outcomes known by the close of bar k. Cached; history never changes. */
-function modelAsOf(s: Series, k: number): Model {
+export function modelAsOf(s: Series, k: number): Model {
   const key = `${s.symbol}:${s.bars[k].ts}`;
   let m = modelCache.get(key);
   if (!m) {
@@ -404,10 +458,66 @@ function phi(x: number): number {
   return x >= 0 ? (1 + y) / 2 : (1 - y) / 2;
 }
 
+// ---- candlestick pattern track record ---------------------------------------
+
+/** Track record of every pattern using only outcomes known by the close of bar k. */
+export function patternStatsAsOf(s: Series, k: number): { baselineUpPct: number; stats: PatternStats[] } {
+  // Occurrences at t <= k-1 have their next hour (t+1) closed by k.
+  let hours = 0;
+  for (let t = 0; t < k; t++) if (s.gaps[t + 1] === s.gaps[t]) hours++;
+  const base = hours ? (s.allCumUp[k - 1] / hours) * 100 : 50;
+  const stats = s.occ.map((o) => {
+    let lo = 0, hi = o.t.length; // count of occurrences with t <= k-1
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (o.t[mid] <= k - 1) lo = mid + 1;
+      else hi = mid;
+    }
+    const count = lo;
+    if (!count) return { count, upPct: 0, avgPct: 0, z: 0, verdict: "rare" as const };
+    const upPct = (o.cumUp[count - 1] / count) * 100;
+    const z = (upPct - base) / (50 / Math.sqrt(count));
+    const verdict = count < 30 ? "rare" : z >= 2 ? "up" : z <= -2 ? "down" : "none";
+    return { count, upPct, avgPct: (o.cumRet[count - 1] / count) * 100, z, verdict } as PatternStats;
+  });
+  return { baselineUpPct: base, stats };
+}
+
+/** Full-history pattern scoreboard (next 1h and 4h) for the Patterns page. */
+export async function patternScoreboard(symbol: string) {
+  const s = await prepare(symbol);
+  const k = s.bars.length - 1;
+  const { baselineUpPct, stats } = patternStatsAsOf(s, k);
+  const up4 = s.occ.map((o) => {
+    const idx = Array.from(o.t).filter((t) => t + 4 <= k && s.gaps[t + 4] === s.gaps[t]);
+    return idx.length ? (idx.filter((t) => s.bars[t + 4].c > s.bars[t].c).length / idx.length) * 100 : null;
+  });
+  const lastSeen = s.occ.map((o) => (o.t.length ? s.bars[o.t[o.t.length - 1]].ts : null));
+  return {
+    symbol,
+    from: s.bars[0].ts,
+    to: s.bars[k].ts + HOUR_MS,
+    hours: k,
+    baselineUpPct,
+    patterns: PATTERNS.map((p, i) => ({
+      id: p.id,
+      name: p.name,
+      code: p.code,
+      group: p.group,
+      textbook: p.textbook,
+      candles: p.candles,
+      description: p.description,
+      stats: stats[i],
+      up4hPct: up4[i],
+      lastSeen: lastSeen[i],
+    })),
+  };
+}
+
 // ---- forecasting core -----------------------------------------------------
 
 /** Forecast for the hour after bar k, using the model as of bar k. */
-function predictAfter(s: Series, k: number, m: Model) {
+export function predictAfter(s: Series, k: number, m: Model) {
   const base = s.bars[k].c;
   const targetTs = s.bars[k].ts + HOUR_MS;
   const mu = predictMu(m, s.X[k]!);
@@ -429,7 +539,8 @@ function predictAfter(s: Series, k: number, m: Model) {
   };
 }
 
-async function prepare(symbol: string): Promise<Series> {
+/** Syncs the DB and returns the cached 1h series for a symbol. */
+export async function prepare(symbol: string): Promise<Series> {
   await ensureSchema();
   const { rows: sym } = await pool.query("SELECT years_back FROM symbols WHERE symbol=$1", [symbol]);
   if (!sym.length) throw new ForecastError(`${symbol} is not in the symbols table - add it on /history first`);
@@ -445,7 +556,7 @@ async function prepare(symbol: string): Promise<Series> {
 }
 
 /** Brings the DB up to date, (re)trains if new candles arrived, predicts the current hour. */
-export async function forecastNextHour(symbol: string, save?: PredictionSource): Promise<Forecast> {
+export async function forecastNextHour(symbol: string): Promise<Forecast> {
   const s = await prepare(symbol);
   const k = s.bars.length - 1;
   const lastTs = s.bars[k].ts;
@@ -470,7 +581,7 @@ export async function forecastNextHour(symbol: string, save?: PredictionSource):
   }
 
   const p = predictAfter(s, k, modelAsOf(s, k));
-  const forecast: Omit<Forecast, "live" | "savedManually"> = {
+  const forecast: Omit<Forecast, "live"> = {
     symbol,
     targetTs: p.targetTs,
     baseClose: p.baseClose,
@@ -483,13 +594,19 @@ export async function forecastNextHour(symbol: string, save?: PredictionSource):
     backtest: bt.backtest,
   };
 
-  if (save) await savePrediction(forecast, save);
   await resolvePredictions();
-  const [live, saved] = await Promise.all([
-    liveStats(symbol),
-    pool.query("SELECT 1 FROM predictions WHERE symbol=$1 AND target_ts=$2 AND source='manual'", [symbol, p.targetTs]),
-  ]);
-  return { ...forecast, live, savedManually: saved.rows.length > 0 };
+  return { ...forecast, live: await liveStats(symbol) };
+}
+
+/** Index of the last bar that opened before `ts` (i.e. closed at or before it). */
+export function barBefore(s: Series, ts: number): number {
+  let lo = 0, hi = s.bars.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (s.bars[mid].ts < ts) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
 }
 
 // ---- explanation ----------------------------------------------------------
@@ -498,9 +615,10 @@ const mini = (b: Bar): MiniCandle => [b.ts, b.o, b.h, b.l, b.c];
 
 /**
  * Explains the forecast for the 1-hour candle containing `atMs` (default: now),
- * made with only the candles that closed before that hour started.
+ * made with only the candles that closed before that hour started. With
+ * `modelFromTs` (a prediction run's start), the model is the one frozen then.
  */
-export async function explainAt(symbol: string, atMs = Date.now()): Promise<Explanation> {
+export async function explainAt(symbol: string, atMs = Date.now(), modelFromTs?: number): Promise<Explanation> {
   const s = await prepare(symbol);
   const { bars } = s;
   const targetTs = Math.floor(atMs / HOUR_MS) * HOUR_MS;
@@ -508,19 +626,14 @@ export async function explainAt(symbol: string, atMs = Date.now()): Promise<Expl
   if (targetTs > last.ts + HOUR_MS) throw new ForecastError("That hour hasn't started yet - pick a candle up to the current hour.");
 
   // k = last candle that closed before the target hour started.
-  let lo = 0, hi = bars.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >> 1;
-    if (bars[mid].ts < targetTs) lo = mid;
-    else hi = mid - 1;
-  }
-  const k = lo;
+  const k = barBefore(s, targetTs);
   if (bars[k].ts + HOUR_MS !== targetTs) throw new ForecastError("Binance has no data just before that hour - pick another point.");
   if (k < LOOKBACK + MIN_TRAIN) {
     throw new ForecastError(`Not enough history before that point - need ${MIN_TRAIN} hours, pick something after ${new Date(bars[LOOKBACK + MIN_TRAIN].ts).toDateString()}.`);
   }
 
-  const m = modelAsOf(s, k);
+  const kModel = modelFromTs !== undefined ? Math.min(k, barBefore(s, modelFromTs)) : k;
+  const m = modelAsOf(s, kModel);
   const p = predictAfter(s, k, m);
   const next = bars[k + 1]?.ts === targetTs ? bars[k + 1] : null;
   const actual = next && {
@@ -553,6 +666,34 @@ export async function explainAt(symbol: string, atMs = Date.now()): Promise<Expl
     learned: `this weekday has historically leaned ${dowC >= 0 ? "up" : "down"}`,
     contributionPct: dowC,
   });
+  // Candlestick patterns: detected ones individually, absent ones lumped together.
+  const { baselineUpPct, stats: pStats } = patternStatsAsOf(s, k);
+  const detected: PatternInfo[] = [];
+  let absent = 0;
+  PATTERNS.forEach((p, i) => {
+    const c = contrib[PATTERN_FEATURE + i] * 100;
+    if (s.masks[k] & (1 << i)) {
+      detected.push({ id: p.id, name: p.name, group: p.group, textbook: p.textbook, candles: p.candles, description: p.description, stats: pStats[i], contributionPct: c });
+      const st = pStats[i];
+      drivers.push({
+        label: `Pattern: ${p.name}`,
+        detail: `formed on the last ${p.candles > 1 ? `${p.candles} candles` : "candle"} (textbook: ${p.textbook === "neutral" ? "indecision" : p.textbook})`,
+        learned:
+          Math.sign(c) === Math.sign(st.upPct - baselineUpPct) || st.verdict === "none" || st.verdict === "rare"
+            ? `after it, BTC closed higher ${st.upPct.toFixed(1)}% of ${st.count} times (any hour: ${baselineUpPct.toFixed(1)}%)`
+            : `after it, BTC closed higher ${st.upPct.toFixed(1)}% of ${st.count} times - the momentum/shape inputs already count that for these candles, so this term only corrects the overlap`,
+        contributionPct: c,
+      });
+    } else {
+      absent += c;
+    }
+  });
+  drivers.push({
+    label: "Patterns not present",
+    detail: `${PATTERNS.length - detected.length} of ${PATTERNS.length} patterns absent`,
+    learned: "the absence of a pattern shifts the forecast very slightly",
+    contributionPct: absent,
+  });
   drivers.sort((a, b) => Math.abs(b.contributionPct) - Math.abs(a.contributionPct));
 
   return {
@@ -566,10 +707,12 @@ export async function explainAt(symbol: string, atMs = Date.now()): Promise<Expl
     expectedPct: p.expectedPct,
     probUp: p.probUp,
     actual,
-    trainedOn: { hours: m.trainHours, from: bars[LOOKBACK].ts, to: bars[k].ts + HOUR_MS },
+    trainedOn: { hours: m.trainHours, from: bars[LOOKBACK].ts, to: bars[kModel].ts + HOUR_MS },
     baselinePct: m.intercept * 100,
     drivers,
     volatility: { recentPct: s.sigma[k] * 100, hourFactor: p.hourFactor, z: m.z, rangePct: p.half * 100 },
+    candlePatterns: { baselineUpPct, detected },
+    discovered: discoveredAt(s, k),
     pattern: bars.slice(k - PATTERN + 1, k + 1).map(mini),
     similar: findSimilar(s, k),
   };
@@ -663,48 +806,25 @@ function findSimilar(s: Series, k: number): Explanation["similar"] {
 
 // ---- prediction log -------------------------------------------------------
 
-export type PredictionSource = "auto" | "manual";
-
-async function savePrediction(f: Omit<Forecast, "live" | "savedManually">, source: PredictionSource) {
-  await pool.query(
-    `INSERT INTO predictions (symbol, target_ts, base_close, predicted_close, lower, upper, source)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (symbol, target_ts, source) DO NOTHING`,
-    [f.symbol, f.targetTs, f.baseClose, f.predictedClose, f.lower, f.upper, source],
-  );
-}
-
 /** Fills actual_close for predictions whose hour has closed and is in the DB. */
 export async function resolvePredictions(): Promise<void> {
   await pool.query(
     `UPDATE predictions p SET actual_close = c.close
      FROM candles c
-     WHERE p.actual_close IS NULL
+     WHERE p.actual_close IS NULL AND p.horizon_min = 60
        AND c.symbol = p.symbol AND c.interval = '1h' AND c.ts = p.target_ts`,
   );
 }
 
 async function liveStats(symbol: string): Promise<Forecast["live"]> {
-  // Auto and manual rows for the same hour hold the same forecast; count each hour once.
+  // Overlapping runs can predict the same hour; count each hour once.
   const { rows } = await pool.query(
     `SELECT COUNT(*)::int AS count,
             AVG(CASE WHEN SIGN(predicted_close - base_close) = SIGN(actual_close - base_close) THEN 100.0 ELSE 0 END)::float8 AS dir,
             AVG(CASE WHEN actual_close BETWEEN lower AND upper THEN 100.0 ELSE 0 END)::float8 AS band
      FROM (SELECT DISTINCT ON (target_ts) * FROM predictions
-           WHERE symbol = $1 AND actual_close IS NOT NULL ORDER BY target_ts) x`,
+           WHERE symbol = $1 AND actual_close IS NOT NULL AND horizon_min = 60 ORDER BY target_ts) x`,
     [symbol],
   );
   return { count: rows[0].count, directionAccuracy: rows[0].dir, bandCoverage: rows[0].band };
-}
-
-/** Used by the hourly scheduler so one prediction per hour is logged even with no page open. */
-export async function forecastAll(): Promise<void> {
-  await ensureSchema();
-  const { rows } = await pool.query("SELECT symbol FROM symbols WHERE active");
-  for (const { symbol } of rows) {
-    try {
-      await forecastNextHour(symbol, "auto");
-    } catch (err) {
-      console.warn(`[forecast] ${symbol}:`, err instanceof Error ? err.message : err);
-    }
-  }
 }
