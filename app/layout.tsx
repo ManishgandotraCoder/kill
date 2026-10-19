@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "bit · Live",
-  description: "Live Binance candles with a next-hour forecast",
+  description: "Live Binance candles and candlestick patterns",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

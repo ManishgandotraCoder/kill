@@ -59,24 +59,3 @@ export function describeKey(key: string): string {
   });
   return `After a ${trend === "↑" ? "rise" : "decline"}: ${candles.join(" → ")}`;
 }
-
-/** Schematic OHLC for drawing a key (each candle opens where the last closed). */
-export function schematic(key: string): [number, number, number, number, number][] {
-  const seq = key.split("|")[1].split(" ");
-  const out: [number, number, number, number, number][] = [];
-  let price = 100;
-  seq.forEach((c, i) => {
-    const doji = c[0] === "N";
-    const body = doji ? 0.15 : c[1] === "s" ? 0.6 : c[1] === "m" ? 1.4 : 2.8;
-    const dir = c[0] === "D" ? -1 : 1;
-    const open = price;
-    const close = doji ? price + 0.05 : price + dir * body;
-    const top = Math.max(open, close), bottom = Math.min(open, close);
-    const long = Math.max(1.2, body * 1.2);
-    const upW = c.endsWith("^") ? long : 0.25;
-    const loW = c.endsWith("v") ? long : 0.25;
-    out.push([i, open, top + upW, bottom - loW, close]);
-    price = close;
-  });
-  return out;
-}

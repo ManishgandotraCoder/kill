@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS background job: runs scripts/sync-candles.ts every 60 seconds, saving each
+  closed 1m candle (and each closed 1h candle). launchd never starts a second copy
+  while one is still running, so the long first backfill is safe. If the Mac was
+  asleep, the next run catches up every missed minute.
+
+  Install:   cp scripts/com.bit.candle-sync.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.bit.candle-sync.plist
+  Run now:   launchctl start com.bit.candle-sync
+  Uninstall: launchctl unload ~/Library/LaunchAgents/com.bit.candle-sync.plist && rm ~/Library/LaunchAgents/com.bit.candle-sync.plist
+  Log:       ~/Library/Logs/bit-candle-sync.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bit.candle-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ethan/.nvm/versions/node/v22.18.0/bin/node</string>
+    <string>/Users/ethan/Projects/Personal Projects/bit/hack/node_modules/tsx/dist/cli.mjs</string>
+    <string>--env-file=.env.local</string>
+    <string>scripts/sync-candles.ts</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/ethan/Projects/Personal Projects/bit/hack</string>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/ethan/Library/Logs/bit-candle-sync.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ethan/Library/Logs/bit-candle-sync.log</string>
+</dict>
+</plist>

@@ -1,5 +1,5 @@
 import { discover } from "@/lib/discover";
-import { ForecastError } from "@/lib/predict";
+import { DataError } from "@/lib/series";
 
 // GET /api/discovered?symbol=BTCUSDT -> candle sequences mined from history, with out-of-sample check
 export async function GET(req: Request) {
@@ -8,7 +8,7 @@ export async function GET(req: Request) {
   try {
     return Response.json(await discover(symbol));
   } catch (err) {
-    if (err instanceof ForecastError) return new Response(err.message, { status: 422 });
+    if (err instanceof DataError) return new Response(err.message, { status: 422 });
     throw err;
   }
 }

@@ -8,7 +8,7 @@
 //      |z| >= 2 -> "confirmed", |z| >= 1 -> "weak", otherwise "failed" (it was luck)
 
 import { CODE_MIN_INDEX, describeKey, encodeCandle, sequenceKey } from "./candle-code";
-import { prepare, type Series } from "./predict";
+import { prepare, type Series } from "./series";
 
 const HOUR_MS = 3_600_000;
 const MAX_LEN = 3;
@@ -151,15 +151,4 @@ function cached(s: Series) {
 
 export async function discover(symbol: string): Promise<Discovery> {
   return cached(await prepare(symbol)).d;
-}
-
-/** Confirmed/weak discovered patterns whose sequence ends at bar k. */
-export function discoveredAt(s: Series, k: number): Discovered[] {
-  const { d, codes } = cached(s);
-  const keys = new Set<string>();
-  for (let len = 1; len <= MAX_LEN; len++) {
-    const key = sequenceKey(s.bars, k, len, codes);
-    if (key) keys.add(key);
-  }
-  return d.patterns.filter((p) => p.tier !== "failed" && keys.has(p.key));
 }

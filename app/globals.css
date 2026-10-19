@@ -1,6 +1,6 @@
 @import "tailwindcss";
 
-/* Design tokens. Chart colours (up/down/forecast) match app/candle-chart.tsx THEMES. */
+/* Design tokens. Chart colours (up/down/selected) match app/candle-chart.tsx THEMES. */
 :root {
   --background: #f6f6f4; /* page */
   --foreground: #1a1a19;
@@ -10,7 +10,7 @@
   --muted: #6b6a65; /* secondary text */
   --up: #0a8f0a;
   --down: #cf3a3a;
-  --accent: #2a78d6; /* forecast */
+  --accent: #2a78d6; /* selection */
   --point: #eb6834; /* picked points */
 }
 

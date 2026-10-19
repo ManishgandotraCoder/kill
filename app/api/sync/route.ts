@@ -1,6 +1,6 @@
 import { syncAll, INTERVALS } from "@/lib/syncCandles";
 
-// Cron entry point: GET /api/sync?interval=1h[&symbol=BTCUSDT]
+// Cron entry point: GET /api/sync?interval=1m[&symbol=BTCUSDT]
 // with header Authorization: Bearer $CRON_SECRET
 
 export const maxDuration = 300;

@@ -1,13 +1,12 @@
-import { fillActiveRuns } from "./runs";
-import { syncAll } from "./syncCandles";
+import { STORED_INTERVALS, syncAll } from "./syncCandles";
 
-// Keeps 1h candles for every active symbol fresh while the server runs:
-// fires one minute past each hour, right after the previous hour's candle closes.
+// Keeps stored candles (1m + 1h) for every active symbol fresh while the server runs:
+// fires a few seconds past each minute, right after the previous minute's candle closes.
 // For serverless deploys, disable this (ENABLE_HOURLY_SYNC=false) and hit
-// /api/sync?interval=1h from an external cron instead.
+// /api/sync?interval=1m from an external cron instead.
 
-const HOUR = 3_600_000;
-const OFFSET = 60_000;
+const MINUTE = 60_000;
+const OFFSET = 5_000;
 
 const g = globalThis as unknown as { hourlySyncStarted?: boolean };
 
@@ -17,16 +16,15 @@ export function startHourlySync() {
 
   const run = async () => {
     try {
-      console.log("[hourly-sync]", await syncAll("1h"));
-      await fillActiveRuns(); // only inside user-defined prediction runs
+      for (const interval of STORED_INTERVALS) console.log(`[candle-sync ${interval}]`, await syncAll(interval));
     } catch (err) {
-      console.error("[hourly-sync] failed", err);
+      console.error("[candle-sync] failed", err);
     }
     schedule();
   };
   const schedule = () => {
     const now = Date.now();
-    const next = Math.floor(now / HOUR) * HOUR + HOUR + OFFSET;
+    const next = Math.floor(now / MINUTE) * MINUTE + MINUTE + OFFSET;
     setTimeout(run, next - now);
   };
   schedule();

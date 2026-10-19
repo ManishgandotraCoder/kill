@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "sync:hourly": "tsx --env-file=.env.local scripts/hourly-sync.ts"
+    "sync": "tsx --env-file=.env.local scripts/sync-candles.ts"
   },
   "dependencies": {
     "lightweight-charts": "^5.2.1",

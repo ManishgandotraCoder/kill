@@ -112,6 +112,9 @@ export function runningSyncs(): SyncProgress[] {
   return [...jobs.values()].filter((j) => j.state.status === "running").map((j) => j.state);
 }
 
+/** Intervals the background job keeps in the DB: 1m for 5 years, plus 1h for pattern discovery. */
+export const STORED_INTERVALS = ["1m", "1h"];
+
 export async function syncAll(interval = "15m", only?: string) {
   await ensureSchema();
   const { rows } = await pool.query(
