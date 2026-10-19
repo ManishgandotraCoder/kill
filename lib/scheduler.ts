@@ -1,3 +1,4 @@
+import { forecastAll } from "./predict";
 import { syncAll } from "./syncCandles";
 
 // Keeps 1h candles for every active symbol fresh while the server runs:
@@ -17,6 +18,7 @@ export function startHourlySync() {
   const run = async () => {
     try {
       console.log("[hourly-sync]", await syncAll("1h"));
+      await forecastAll(); // log a next-hour prediction per symbol
     } catch (err) {
       console.error("[hourly-sync] failed", err);
     }

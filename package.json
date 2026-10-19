@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "sync:hourly": "tsx --env-file=.env.local scripts/hourly-sync.ts"
   },
   "dependencies": {
     "lightweight-charts": "^5.2.1",
@@ -24,6 +25,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.4.2",
     "tailwindcss": "^4",
+    "tsx": "^4.23.15",
     "typescript": "^5"
   }
 }
