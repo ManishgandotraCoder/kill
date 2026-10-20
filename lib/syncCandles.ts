@@ -20,6 +20,44 @@ export interface SyncProgress {
   error?: string;
 }
 
+async function insertKlines(symbol: string, interval: string, rows: KlineRow[]) {
+  await pool.query(
+    `INSERT INTO candles (symbol, interval, ts, open, high, low, close, volume)
+     SELECT $1::text, $2::text, * FROM unnest($3::bigint[], $4::numeric[], $5::numeric[],
+                                  $6::numeric[], $7::numeric[], $8::numeric[])
+     ON CONFLICT DO NOTHING`,
+    [symbol, interval, ...[0, 1, 2, 3, 4, 5].map((i) => rows.map((k) => k[i]))]
+  );
+}
+
+/**
+ * Fills the start of the window if the oldest stored candle is newer than `yearsBack` ago
+ * (e.g. rows were deleted). Forward sync alone never looks back. Returns candles added.
+ */
+async function fillStart(symbol: string, interval: string, yearsBack: number): Promise<number> {
+  const step = INTERVALS[interval];
+  const { rows } = await pool.query("SELECT MIN(ts) AS first FROM candles WHERE symbol=$1 AND interval=$2", [symbol, interval]);
+  if (!rows[0].first) return 0; // empty: the forward sync downloads everything
+  const first = Number(rows[0].first);
+  let start = Math.ceil((Date.now() - yearsBack * 365 * 24 * 3600 * 1000) / step) * step;
+  let saved = 0;
+  while (start < first) {
+    const res = await fetch(
+      `${URL}?symbol=${symbol}&interval=${interval}&limit=1000&startTime=${start}&endTime=${first - 1}`,
+      { cache: "no-store" }
+    );
+    if (!res.ok) throw new Error(`${symbol}: ${res.status} ${await res.text()}`);
+    const data: KlineRow[] = await res.json();
+    if (!data.length) break;
+    await insertKlines(symbol, interval, data);
+    saved += data.length;
+    start = data[data.length - 1][0] + step;
+    if (data.length < 1000) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return saved;
+}
+
 async function syncOne(
   symbol: string,
   interval: string,
@@ -36,8 +74,8 @@ async function syncOne(
     : Date.now() - yearsBack * 365 * 24 * 3600 * 1000;
   const from = start;
   const end = Date.now();
-  let saved = 0;
-  onProgress(0, 0);
+  let saved = await fillStart(symbol, interval, yearsBack);
+  onProgress(0, saved);
 
   while (true) {
     const res = await fetch(
@@ -50,13 +88,7 @@ async function syncOne(
 
     const closed = data.filter((k) => k[6] < Date.now());
     if (closed.length) {
-      await pool.query(
-        `INSERT INTO candles (symbol, interval, ts, open, high, low, close, volume)
-         SELECT $1::text, $2::text, * FROM unnest($3::bigint[], $4::numeric[], $5::numeric[],
-                                      $6::numeric[], $7::numeric[], $8::numeric[])
-         ON CONFLICT DO NOTHING`,
-        [symbol, interval, ...[0, 1, 2, 3, 4, 5].map((i) => closed.map((k) => k[i]))]
-      );
+      await insertKlines(symbol, interval, closed);
       saved += closed.length;
     }
 

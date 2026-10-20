@@ -1,33 +1,25 @@
 @import "tailwindcss";
 
-/* Design tokens. Chart colours (up/down/selected) match app/candle-chart.tsx THEMES. */
+/*
+ * darkMode "ghost" theme: always dark. Near-black background with a faint violet haze, smoky
+ * translucent panels, soft white text, mint / coral for up / down, ghost-violet accent.
+ * Chart colours match app/candle-chart.tsx THEME.
+ */
 :root {
-  --background: #f6f6f4; /* page */
-  --foreground: #1a1a19;
-  --panel: #ffffff; /* cards */
-  --panel-2: #f1f1ee; /* insets, tracks */
-  --line: #e4e3df; /* borders */
-  --muted: #6b6a65; /* secondary text */
-  --up: #0a8f0a;
-  --down: #cf3a3a;
-  --accent: #2a78d6; /* selection */
-  --point: #eb6834; /* picked points */
+  color-scheme: dark;
+  --background: #040406; /* page: near-black */
+  --foreground: #d3d5de; /* soft, not pure white */
+  --panel: #09090dee; /* cards */
+  --panel-2: #0f1016; /* insets, tracks */
+  --line: #181a22; /* borders */
+  --muted: #6c7084; /* secondary text */
+  --up: #2fbf82;
+  --down: #e95a70;
+  --accent: #9a86f2; /* ghost violet */
+  --point: #e09a72;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #121211;
-    --foreground: #ececea;
-    --panel: #1a1a19;
-    --panel-2: #232321;
-    --line: #2e2e2b;
-    --muted: #9c9b95;
-    --up: #2fbf4a;
-    --down: #ef5a5a;
-    --accent: #3987e5;
-    --point: #d95926;
-  }
-}
+@custom-variant dark (&:where(.dark, .dark *));
 
 @theme inline {
   --color-background: var(--background);
@@ -45,18 +37,40 @@
 }
 
 body {
-  background: var(--background);
+  background:
+    radial-gradient(1200px 600px at 15% -10%, #9a86f20b, transparent 60%),
+    radial-gradient(900px 500px at 100% 0%, #2fbf8205, transparent 55%),
+    var(--background);
+  background-attachment: fixed;
   color: var(--foreground);
   font-family: var(--font-geist-sans), system-ui, sans-serif;
   /* Fixed-width digits so live prices don't jitter. */
   font-variant-numeric: tabular-nums;
 }
 
+::selection {
+  background: #9a86f244;
+}
+
 @layer components {
   .card {
-    @apply rounded-xl border border-line bg-panel;
+    @apply rounded-xl border border-line bg-panel backdrop-blur-sm;
+    box-shadow: 0 1px 0 #ffffff05 inset, 0 10px 30px -12px #000000cc;
+  }
+  /* soft ghost-violet halo for focal cards */
+  .ghost-glow {
+    box-shadow: 0 1px 0 #ffffff06 inset, 0 0 0 1px #9a86f218, 0 20px 60px -24px #9a86f230;
   }
   .eyebrow {
     @apply text-[11px] font-medium tracking-wider text-muted uppercase;
   }
+}
+
+/* Native form controls in the dark palette. */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.6);
+}
+select,
+input {
+  color-scheme: dark;
 }

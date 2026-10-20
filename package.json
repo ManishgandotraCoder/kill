@@ -7,7 +7,11 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "sync": "tsx --env-file=.env.local scripts/sync-candles.ts"
+    "sync": "tsx --env-file=.env.local scripts/sync-candles.ts",
+    "patterns": "tsx --env-file=.env.local scripts/detect-patterns.ts",
+    "validate": "tsx --env-file=.env.local scripts/validate-candles.ts",
+    "test": "tsx --env-file=.env.local --test tests/*.test.ts",
+    "train": "NODE_OPTIONS=--max-old-space-size=6144 tsx --env-file=.env.local scripts/train-model.ts"
   },
   "dependencies": {
     "lightweight-charts": "^5.2.1",

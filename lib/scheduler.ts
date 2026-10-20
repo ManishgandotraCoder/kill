@@ -1,3 +1,6 @@
+import { detectNewCandles } from "./pattern-store";
+import { resolveDue } from "./predictions";
+import { recordSignals } from "./signal-log";
 import { STORED_INTERVALS, syncAll } from "./syncCandles";
 
 // Keeps stored candles (1m + 1h) for every active symbol fresh while the server runs:
@@ -17,6 +20,9 @@ export function startHourlySync() {
   const run = async () => {
     try {
       for (const interval of STORED_INTERVALS) console.log(`[candle-sync ${interval}]`, await syncAll(interval));
+      console.log("[pattern-detect 1h]", await detectNewCandles("1h"));
+      console.log("[signals]", await recordSignals());
+      console.log("[predictions]", await resolveDue());
     } catch (err) {
       console.error("[candle-sync] failed", err);
     }

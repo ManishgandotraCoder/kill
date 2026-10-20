@@ -2,8 +2,16 @@
 
 import { useState } from "react";
 import { useBinanceStream, useStreamStatus } from "@/lib/binance/hooks";
+import Link from "next/link";
+import { useAuth } from "./auth";
 import CandleChart from "./candle-chart";
 import { useDiscovered } from "./discovered";
+import AiSignal from "./ai-signal";
+import PatternPanel from "./pattern-panel";
+import PredictionsSidebar from "./predictions-sidebar";
+import StartPrediction from "./start-prediction";
+import { usePredictions } from "./use-predictions";
+import { useSignal } from "./use-signal";
 
 const SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"];
 
@@ -28,15 +36,22 @@ export default function MarketView() {
   const ticker = useBinanceStream<Ticker>(`${symbol.toLowerCase()}@ticker`);
   const trade = useBinanceStream<Trade>(`${symbol.toLowerCase()}@trade`);
   const discovered = useDiscovered(symbol);
+  const signal = useSignal(symbol);
+  const { user, loading: authLoading } = useAuth();
+  const predictions = usePredictions(symbol, !!user);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
 
   const change = ticker ? Number(ticker.P) : 0;
   const livePrice = ticker ? Number(ticker.c) : null;
 
   return (
-    <div className="mx-auto w-full max-w-[1680px] px-4 py-5 text-sm">
+    <div
+      className={`mx-auto grid w-full max-w-[1680px] items-start gap-5 px-4 py-5 text-sm ${sidebarOpen ? "lg:grid-cols-[minmax(0,1fr)_360px]" : ""}`}
+    >
       <main className="min-w-0">
         {/* symbol + price */}
-        <section className="card mb-5 p-5">
+        {/* relative z-20: the Start Predicting popover must sit above the cards below (each card is its own stacking layer because of backdrop-blur) */}
+        <section className="card relative z-20 mb-5 p-5">
           <div className="mb-4 flex flex-wrap items-center gap-2" role="tablist" aria-label="Symbol">
             {SYMBOLS.map((s) => (
               <button
@@ -45,14 +60,38 @@ export default function MarketView() {
                 aria-selected={s === symbol}
                 onClick={() => setSymbol(s)}
                 className={`rounded-full px-3 py-1 text-xs font-medium transition-colors ${
-                  s === symbol ? "bg-foreground text-background" : "bg-panel-2 text-muted hover:text-foreground"
+                  s === symbol ? "bg-accent/15 text-accent ring-1 ring-accent/30" : "bg-panel-2 text-muted hover:text-foreground"
                 }`}
               >
                 {s.replace("USDT", "")}
                 <span className="opacity-60">/USDT</span>
               </button>
             ))}
-            {status !== "open" && <span className="text-xs text-amber-600">connection: {status}</span>}
+            {status !== "open" && <span className="text-xs text-amber-400">connection: {status}</span>}
+            <div className="ml-auto flex items-center gap-2">
+              {user ? (
+                <StartPrediction
+                  symbol={symbol}
+                  onStart={async (m) => {
+                    await predictions.start(m);
+                    setSidebarOpen(true);
+                  }}
+                />
+              ) : (
+                !authLoading && (
+                  <Link href="/login" className="rounded-lg bg-accent/15 text-accent ring-1 ring-accent/40 hover:bg-accent/25 px-3 py-1.5 text-xs font-semibold">
+                    ▶ Log in to predict
+                  </Link>
+                )
+              )}
+              <button
+                onClick={() => setSidebarOpen(!sidebarOpen)}
+                aria-pressed={sidebarOpen}
+                className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${sidebarOpen ? "bg-panel-2 text-foreground" : "bg-panel-2 text-muted hover:text-foreground"}`}
+              >
+                Predictions{predictions.running.length > 0 && ` · ${predictions.running.length} running`}
+              </button>
+            </div>
           </div>
 
           <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
@@ -89,9 +128,16 @@ export default function MarketView() {
         </section>
 
         <section className="card mb-5 p-4">
-          <CandleChart symbol={symbol} discovered={discovered} />
+          <CandleChart symbol={symbol} discovered={discovered} forecast={signal.data} />
         </section>
+
+        <AiSignal symbol={symbol} signal={signal} />
+
+        <PatternPanel symbol={symbol} />
       </main>
+      {sidebarOpen && (
+        <PredictionsSidebar symbol={symbol} predictions={predictions} livePrice={livePrice} loggedIn={!!user} onClose={() => setSidebarOpen(false)} />
+      )}
     </div>
   );
 }

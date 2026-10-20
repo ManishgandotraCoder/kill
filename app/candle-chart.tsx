@@ -7,11 +7,14 @@ import {
   createChart,
   createSeriesMarkers,
   HistogramSeries,
+  LineSeries,
+  LineStyle,
   TickMarkType,
   type IChartApi,
   type ISeriesApi,
   type ISeriesMarkersPluginApi,
   type MouseEventParams,
+  type SeriesMarker,
   type Time,
   type UTCTimestamp,
 } from "lightweight-charts";
@@ -26,18 +29,29 @@ import {
   klineStreamName,
 } from "@/lib/binance/klines";
 import { sequenceKey } from "@/lib/candle-code";
-import { detectMask, patternsIn, type PatternDef } from "@/lib/patterns";
+import { PATTERN_INFO, type PatternKey } from "@/lib/pattern-detect";
 import type { DiscoveredLite } from "./discovered";
+import type { SignalData } from "./use-signal";
+import { hasStoredPatterns, STORED_PATTERN_INTERVALS, type StoredPattern } from "./stored-patterns";
 
-export const THEMES = {
-  light: { surface: "#fcfcfb", text: "#5f5e5a", grid: "#ecebe8", border: "#d9d8d4", up: "#0ca30c", down: "#d03b3b", discovered: "#6250d6" },
-  dark: { surface: "#1a1a19", text: "#a3a29d", grid: "#2a2a28", border: "#3a3a37", up: "#0ca30c", down: "#d03b3b", discovered: "#9085e9" },
+/** Chart palette of the darkMode ghost theme (matches the tokens in app/globals.css). */
+export const THEME = {
+  surface: "#060609", text: "#6c7084", grid: "#101118", border: "#181a22",
+  up: "#2fbf82", down: "#e95a70", discovered: "#9a86f2", neutral: "#50546a",
 };
 
-type Theme = (typeof THEMES)["light"];
+type Theme = typeof THEME;
 
 export function currentTheme(): Theme {
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? THEMES.dark : THEMES.light;
+  return THEME;
+}
+
+/** Time-axis labels in the viewer's local time (lightweight-charts defaults to UTC). */
+export function localTick(t: Time, type: TickMarkType): string {
+  const d = new Date((t as number) * 1000);
+  return type === TickMarkType.Time || type === TickMarkType.TimeWithSeconds
+    ? d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false })
+    : d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 function toBar(c: Candle) {
@@ -49,15 +63,25 @@ function toVolume(c: Candle, t: Theme) {
   return { time: c.time as UTCTimestamp, value: c.volume, color: (c.close >= c.open ? t.up : t.down) + "66" };
 }
 
+const EMPTY_ROWS: StoredPattern[] = [];
+
 const BAR_SECONDS: Record<KlineInterval, number> = { "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400 };
 
 interface Props {
   symbol: string;
   /** Discovered patterns to mark (1h chart only - they were found on 1h candles). */
   discovered?: DiscoveredLite[];
+  /** Current AI signal: drawn as a forecast line from the signal's price over its look-ahead. */
+  forecast?: SignalData;
 }
 
-export default function CandleChart({ symbol, discovered = [] }: Props) {
+/** Trendlines drawn for the most recent detected patterns on the chart. */
+const MAX_PATTERN_LINES = 12;
+
+/** Max points of the forecast line (a 1-day look-ahead on the 1m chart is 1440). */
+const MAX_FORECAST_POINTS = 1500;
+
+export default function CandleChart({ symbol, discovered = [], forecast }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<{ api: ISeriesMarkersPluginApi<Time>; byTime: Map<number, Candle> } | null>(null);
   const nowLineRef = useRef<HTMLDivElement>(null);
@@ -68,20 +92,31 @@ export default function CandleChart({ symbol, discovered = [] }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [loadedKey, setLoadedKey] = useState("");
   const [closedTick, setClosedTick] = useState(0);
-  const [showPatterns, setShowPatterns] = useState(true);
+  const [showDetected, setShowDetected] = useState(true);
+  const [detected, setDetected] = useState<{ key: string; rows: StoredPattern[]; error?: string }>({ key: "", rows: [] });
+  const [hoverDetected, setHoverDetected] = useState<StoredPattern[]>([]);
+  const detectedAtRef = useRef(new Map<number, StoredPattern[]>());
   const [showDiscovered, setShowDiscovered] = useState(true);
-  const [hoverPatterns, setHoverPatterns] = useState<PatternDef[]>([]);
+  const [showForecast, setShowForecast] = useState(true);
+  const forecastRef = useRef<{
+    chart: IChartApi;
+    line: ISeriesApi<"Line">;
+    upper: ISeriesApi<"Line">;
+    lower: ISeriesApi<"Line">;
+    /** Chart + look-ahead the view was last framed for (re-framed only when this changes). */
+    framed: string;
+  } | null>(null);
   const [hoverDiscovered, setHoverDiscovered] = useState<DiscoveredLite[]>([]);
   const discoveredAtRef = useRef(new Map<number, DiscoveredLite[]>());
-  /** Patterns completed at each bar (time in seconds), for the hover readout. */
-  const patternsAtRef = useRef(new Map<number, PatternDef[]>());
+  /** Reusable line series that draw the trendlines / necklines of recent detected patterns. */
+  const patternLinesRef = useRef<ISeriesApi<"Line">[]>([]);
 
 
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
 
-    let theme = currentTheme();
+    const theme = currentTheme();
     const chart: IChartApi = createChart(el, {
       autoSize: true,
       layout: {
@@ -98,12 +133,7 @@ export default function CandleChart({ symbol, discovered = [] }: Props) {
         secondsVisible: false,
         // lightweight-charts renders UTC by default; show the viewer's local time.
         // Day/month/year ticks show the date, intraday ticks the time.
-        tickMarkFormatter: (t: Time, type: TickMarkType) => {
-          const d = new Date((t as number) * 1000);
-          return type === TickMarkType.Time || type === TickMarkType.TimeWithSeconds
-            ? d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false })
-            : d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-        },
+        tickMarkFormatter: localTick,
       },
       localization: { timeFormatter: (t: Time) => new Date((t as number) * 1000).toLocaleString() },
     });
@@ -122,6 +152,21 @@ export default function CandleChart({ symbol, discovered = [] }: Props) {
       1,
     );
     chart.panes()[1]?.setHeight(90);
+
+    // Pattern lines: a small pool of dashed two-point series, filled by the markers effect.
+    patternLinesRef.current = Array.from({ length: MAX_PATTERN_LINES }, () =>
+      chart.addSeries(LineSeries, { lineWidth: 1, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }),
+    );
+
+    // AI forecast: expected path (solid) and the typical-move band (dotted), filled in by an effect below.
+    const lineOpts = { priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false } as const;
+    forecastRef.current = {
+      chart,
+      framed: "",
+      line: chart.addSeries(LineSeries, { ...lineOpts, lineWidth: 2, lastValueVisible: true }),
+      upper: chart.addSeries(LineSeries, { ...lineOpts, lineWidth: 1, lineStyle: LineStyle.Dotted }),
+      lower: chart.addSeries(LineSeries, { ...lineOpts, lineWidth: 1, lineStyle: LineStyle.Dotted }),
+    };
 
     const byTime = new Map<number, Candle>();
     markersRef.current = { api: createSeriesMarkers(candles, []), byTime };
@@ -196,29 +241,18 @@ export default function CandleChart({ symbol, discovered = [] }: Props) {
 
     const onMove = (p: MouseEventParams) => {
       setHover(p.time !== undefined ? (byTime.get(p.time as number) ?? null) : null);
-      setHoverPatterns(p.time !== undefined ? (patternsAtRef.current.get(p.time as number) ?? []) : []);
       setHoverDiscovered(p.time !== undefined ? (discoveredAtRef.current.get(p.time as number) ?? []) : []);
+      setHoverDetected(p.time !== undefined ? (detectedAtRef.current.get(p.time as number) ?? []) : []);
     };
     chart.subscribeCrosshairMove(onMove);
-
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const onScheme = () => {
-      theme = currentTheme();
-      chart.applyOptions({
-        layout: { background: { type: ColorType.Solid, color: theme.surface }, textColor: theme.text, panes: { separatorColor: theme.border } },
-        grid: { vertLines: { color: theme.grid }, horzLines: { color: theme.grid } },
-        rightPriceScale: { borderColor: theme.border },
-        timeScale: { borderColor: theme.border },
-      });
-    };
-    mq.addEventListener("change", onScheme);
 
     return () => {
       cancelled = true;
       unsub();
-      mq.removeEventListener("change", onScheme);
       chart.unsubscribeCrosshairMove(onMove);
       markersRef.current = null;
+      forecastRef.current = null;
+      patternLinesRef.current = [];
       window.clearInterval(nowTimer);
       timeScale.unsubscribeVisibleLogicalRangeChange(updateNow);
       timeScale.unsubscribeSizeChange(updateNow);
@@ -228,34 +262,62 @@ export default function CandleChart({ symbol, discovered = [] }: Props) {
     };
   }, [symbol, interval]);
 
-  // Pattern markers (classic + discovered) on the loaded candles.
+  // Stored detections (pattern_detections) for the loaded range only; refreshed as candles close.
+  useEffect(() => {
+    const m = markersRef.current;
+    if (!hasStoredPatterns(interval) || !loadedKey || !m || !m.byTime.size) return;
+    const times = [...m.byTime.keys()];
+    const from = Math.min(...times) * 1000, to = Math.max(...times) * 1000;
+    const ctrl = new AbortController();
+    fetch(`/api/patterns?symbol=${symbol}&interval=${interval}&from=${from}&to=${to}&limit=1000`, { signal: ctrl.signal, cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : r.text().then((t) => Promise.reject(new Error(t || `HTTP ${r.status}`)))))
+      .then((d: { items: StoredPattern[] }) => setDetected({ key: loadedKey, rows: d.items }))
+      .catch((err: Error) => err.name !== "AbortError" && setDetected({ key: loadedKey, rows: [], error: err.message }));
+    return () => ctrl.abort();
+  }, [symbol, interval, loadedKey, closedTick]);
+
+  // Forecast line: from the signal candle's close (price p0) to the end of the look-ahead window,
+  // ending at p0 x (1 + expectedMove); the band widens like sqrt(time) to +-typicalMove.
+  useEffect(() => {
+    const f = forecastRef.current;
+    if (!f || !loadedKey) return;
+    const clear = () => [f.line, f.upper, f.lower].forEach((x) => x.setData([]));
+    if (!showForecast || !forecast || forecast.symbol !== symbol) return clear();
+    const bar = BAR_SECONDS[interval];
+    const start = Math.floor((forecast.at + forecast.stepMs) / 1000 / bar) * bar; // the signal candle's close
+    const end = start + Math.round((forecast.horizon * forecast.stepMs) / 1000);
+    const n = Math.ceil((end - start) / bar);
+    if (n < 1 || n > MAX_FORECAST_POINTS) return clear(); // e.g. a 15-min look-ahead on the 1d chart
+    const theme = currentTheme();
+    const color = forecast.lean === "up" ? theme.up : forecast.lean === "down" ? theme.down : theme.neutral;
+    const p0 = forecast.close;
+    const pts = Array.from({ length: n + 1 }, (_, i) => ({ time: (start + i * bar) as UTCTimestamp, frac: Math.min(1, i / n) }));
+    f.line.setData(pts.map((p) => ({ time: p.time, value: p0 * (1 + forecast.expectedMove * p.frac) })));
+    f.upper.setData(pts.map((p) => ({ time: p.time, value: p0 * (1 + forecast.expectedMove * p.frac + forecast.typicalMove * Math.sqrt(p.frac)) })));
+    f.lower.setData(pts.map((p) => ({ time: p.time, value: p0 * (1 + forecast.expectedMove * p.frac - forecast.typicalMove * Math.sqrt(p.frac)) })));
+    // Frame recent candles + the whole forecast once per chart/look-ahead; later refreshes keep the user's view.
+    const frameKey = `${loadedKey}:${forecast.interval}:${forecast.horizon}`;
+    if (f.framed !== frameKey) {
+      f.framed = frameKey;
+      const past = Math.max(n, 120) * bar;
+      f.chart.timeScale().setVisibleRange({ from: (start - past) as UTCTimestamp, to: (end + 3 * bar) as UTCTimestamp });
+    }
+    const arrow = forecast.lean === "up" ? "▲" : forecast.lean === "down" ? "▼" : "•";
+    f.line.applyOptions({ color, title: `AI ${forecast.horizonLabel} ${arrow} ${(forecast.pUp * 100).toFixed(0)}%` });
+    f.upper.applyOptions({ color: color + "99" });
+    f.lower.applyOptions({ color: color + "99" });
+  }, [forecast, showForecast, symbol, interval, loadedKey]);
+
+  const detectedRows = detected.key.startsWith(`${symbol}:${interval}:`) ? detected.rows : EMPTY_ROWS;
+
+  // Markers (discovered sequences + stored chart-pattern breakouts) and lines of recent patterns.
   useEffect(() => {
     const m = markersRef.current;
     if (!m) return;
     const theme = currentTheme();
 
-    // Candlestick patterns on the closed candles currently loaded.
     const closed = [...m.byTime.values()].filter((c) => c.closed).sort((a, b) => a.time - b.time);
     const ohlc = closed.map((c) => ({ o: c.open, h: c.high, l: c.low, c: c.close }));
-    const at = new Map<number, PatternDef[]>();
-    closed.forEach((c, i) => {
-      const found = patternsIn(detectMask(ohlc, i));
-      if (found.length) at.set(c.time, found);
-    });
-    patternsAtRef.current = at;
-    const patternMarkers = showPatterns
-      ? [...at].flatMap(([time, found]) => {
-          // Doji / spinning top are everywhere; keep markers for directional patterns.
-          const shown = found.filter((p) => p.textbook !== "neutral");
-          if (!shown.length) return [];
-          const ups = shown.filter((p) => p.textbook === "up");
-          const downs = shown.filter((p) => p.textbook === "down");
-          return [
-            ...(ups.length ? [{ time: time as UTCTimestamp, position: "belowBar" as const, shape: "arrowUp" as const, color: theme.up, text: ups.map((p) => p.code).join(" "), size: 0.7 }] : []),
-            ...(downs.length ? [{ time: time as UTCTimestamp, position: "aboveBar" as const, shape: "arrowDown" as const, color: theme.down, text: downs.map((p) => p.code).join(" "), size: 0.7 }] : []),
-          ];
-        })
-      : [];
 
     // Discovered sequences (found on 1h candles, so only marked on the 1h chart).
     const byKey = new Map(discovered.map((d) => [d.key, d]));
@@ -283,8 +345,50 @@ export default function CandleChart({ symbol, discovered = [] }: Props) {
         }))
       : [];
 
-    m.api.setMarkers([...patternMarkers, ...discoveredMarkers].sort((a, b) => (a.time as number) - (b.time as number)));
-  }, [interval, loadedKey, closedTick, showPatterns, showDiscovered, discovered]);
+    // Stored detections: green arrow below = bullish breakout, red arrow above = bearish.
+    const detAt = new Map<number, StoredPattern[]>();
+    for (const r of detectedRows) {
+      const t = r.ts / 1000;
+      if (m.byTime.has(t)) detAt.set(t, [...(detAt.get(t) ?? []), r]);
+    }
+    detectedAtRef.current = detAt;
+    const detectedMarkers = showDetected
+      ? [...detAt].flatMap(([time, rows]) =>
+          (["bullish", "bearish", "neutral"] as const).flatMap((dir): SeriesMarker<Time>[] => {
+            const hits = rows.filter((r) => r.direction === dir);
+            if (!hits.length) return [];
+            const text = hits.map((r) => PATTERN_INFO[r.pattern].code).join(" ");
+            const t = time as UTCTimestamp;
+            return dir === "bullish"
+              ? [{ time: t, position: "belowBar", shape: "arrowUp", color: theme.up, text, size: 0.7 }]
+              : dir === "bearish"
+                ? [{ time: t, position: "aboveBar", shape: "arrowDown", color: theme.down, text, size: 0.7 }]
+                : [{ time: t, position: "aboveBar", shape: "circle", color: theme.neutral, text, size: 0.4 }];
+          }),
+        )
+      : [];
+
+    // Trendlines / necklines of the most recent detections whose lines are fully in the loaded range.
+    const pool = patternLinesRef.current;
+    const lines = showDetected
+      ? [...detectedRows]
+          .sort((a, b) => b.ts - a.ts)
+          .flatMap((r) => r.meta.lines.map((l) => ({ l, dir: r.direction })))
+          .filter(({ l }) => m.byTime.has(l.a.ts / 1000) && m.byTime.has(l.b.ts / 1000) && l.b.ts > l.a.ts)
+          .slice(0, pool.length)
+      : [];
+    pool.forEach((series, i) => {
+      const x = lines[i];
+      if (!x) return series.setData([]);
+      series.applyOptions({ color: (x.dir === "bullish" ? theme.up : x.dir === "bearish" ? theme.down : theme.neutral) + "bb" });
+      series.setData([
+        { time: (x.l.a.ts / 1000) as UTCTimestamp, value: x.l.a.p },
+        { time: (x.l.b.ts / 1000) as UTCTimestamp, value: x.l.b.p },
+      ]);
+    });
+
+    m.api.setMarkers([...discoveredMarkers, ...detectedMarkers].sort((a, b) => (a.time as number) - (b.time as number)));
+  }, [interval, loadedKey, closedTick, showDiscovered, discovered, showDetected, detectedRows]);
 
   const shown = hover ?? last;
 
@@ -306,25 +410,34 @@ export default function CandleChart({ symbol, discovered = [] }: Props) {
           ))}
         </div>
         <button
-          onClick={() => setShowPatterns(!showPatterns)}
-          aria-pressed={showPatterns}
-          className={`rounded-lg px-2.5 py-1 text-xs font-medium transition-colors ${showPatterns ? "bg-foreground text-background" : "bg-panel-2 text-muted hover:text-foreground"}`}
-          title="Mark the 20 classic candlestick patterns"
+          onClick={() => setShowForecast(!showForecast)}
+          aria-pressed={showForecast}
+          className={`rounded-lg px-2.5 py-1 text-xs font-medium transition-colors ${showForecast ? "bg-accent/15 text-accent ring-1 ring-accent/30" : "bg-panel-2 text-muted hover:text-foreground"}`}
+          title="AI forecast line: expected path over the selected look-ahead (solid) and the typical move range (dotted)"
         >
-          Classic
+          AI line{forecast ? ` · ${forecast.horizonLabel}` : ""}
+        </button>
+        <button
+          onClick={() => setShowDetected(!showDetected)}
+          aria-pressed={showDetected}
+          disabled={!hasStoredPatterns(interval)}
+          className={`-ml-2 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors disabled:opacity-40 ${showDetected ? "bg-accent/15 text-accent ring-1 ring-accent/30" : "bg-panel-2 text-muted hover:text-foreground"}`}
+          title={hasStoredPatterns(interval) ? "Chart patterns found by the detector: breakout markers and the pattern's trendlines" : `Chart patterns are detected on ${STORED_PATTERN_INTERVALS.join(" / ")} candles - switch to ${STORED_PATTERN_INTERVALS[0]}`}
+        >
+          Chart patterns{hasStoredPatterns(interval) && detected.key === loadedKey && !detected.error ? ` · ${detectedRows.length}` : ""}
         </button>
         <button
           onClick={() => setShowDiscovered(!showDiscovered)}
           aria-pressed={showDiscovered}
           disabled={interval !== "1h"}
-          className={`-ml-2 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors disabled:opacity-40 ${showDiscovered ? "bg-[#6250d6] text-white dark:bg-[#9085e9] dark:text-black" : "bg-panel-2 text-muted hover:text-foreground"}`}
+          className={`-ml-2 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors disabled:opacity-40 ${showDiscovered ? "bg-accent/15 text-accent ring-1 ring-accent/30" : "bg-panel-2 text-muted hover:text-foreground"}`}
           title={interval === "1h" ? "Mark patterns the app discovered in 5 years of data" : "Discovered patterns are found on 1h candles - switch to 1h"}
         >
           ★ Discovered
         </button>
         {shown && <OhlcReadout c={shown} />}
         {hover && hoverDiscovered.length > 0 && (
-          <span className="text-xs text-[#6250d6] dark:text-[#9085e9]">
+          <span className="text-xs text-accent">
             {hoverDiscovered.map((d) => (
               <span key={d.id} className="mr-2">
                 ★{d.id} {d.direction === "up" ? "▲" : "▼"} {d.description}
@@ -332,11 +445,11 @@ export default function CandleChart({ symbol, discovered = [] }: Props) {
             ))}
           </span>
         )}
-        {hover && hoverPatterns.length > 0 && (
+        {hover && hoverDetected.length > 0 && (
           <span className="text-xs">
-            {hoverPatterns.map((p) => (
-              <span key={p.id} className={`mr-2 ${p.textbook === "up" ? "text-up" : p.textbook === "down" ? "text-down" : "text-muted"}`}>
-                {p.textbook === "up" ? "▲" : p.textbook === "down" ? "▼" : "↔"} {p.name}
+            {hoverDetected.map((r) => (
+              <span key={r.id} className={`mr-2 font-medium ${r.direction === "bullish" ? "text-up" : r.direction === "bearish" ? "text-down" : "text-muted"}`}>
+                {r.direction === "bullish" ? "▲" : r.direction === "bearish" ? "▼" : "●"} {PATTERN_INFO[r.pattern as PatternKey].name}
               </span>
             ))}
           </span>
@@ -350,15 +463,16 @@ export default function CandleChart({ symbol, discovered = [] }: Props) {
         <div
           ref={nowLineRef}
           aria-hidden
-          className="pointer-events-none absolute top-px left-0 z-10 hidden border-l-2 border-dotted border-zinc-500"
+          className="pointer-events-none absolute top-px left-0 z-10 hidden border-l-2 border-dotted border-muted"
         >
           <span
             ref={nowLabelRef}
-            className="absolute top-1 left-1 rounded bg-zinc-500 px-1 text-[10px] leading-4 text-white dark:text-black"
+            className="absolute top-1 left-1 rounded bg-panel-2 px-1 text-[10px] leading-4 text-foreground ring-1 ring-line"
           />
         </div>
       </div>
-      {error && <p className="mt-2 text-rose-600">{error}</p>}
+      {error && <p className="mt-2 text-down">{error}</p>}
+      {detected.error && hasStoredPatterns(interval) && <p className="mt-2 text-xs text-down">Couldn&apos;t load stored patterns: {detected.error}</p>}
     </div>
   );
 }
@@ -367,11 +481,11 @@ export function OhlcReadout({ c }: { c: Candle }) {
   const up = c.close >= c.open;
   const pct = ((c.close - c.open) / c.open) * 100;
   return (
-    <span className="text-xs text-zinc-500">
+    <span className="text-xs text-muted">
       {new Date(c.time * 1000).toLocaleString()} · O <b className="text-foreground font-normal">{fmt(c.open)}</b> H{" "}
       <b className="text-foreground font-normal">{fmt(c.high)}</b> L <b className="text-foreground font-normal">{fmt(c.low)}</b> C{" "}
       <b className="text-foreground font-normal">{fmt(c.close)}</b>{" "}
-      <span className={up ? "text-emerald-600" : "text-rose-600"}>
+      <span className={up ? "text-up" : "text-down"}>
         {up ? "▲" : "▼"} {pct.toFixed(2)}%
       </span>{" "}
       · Vol <b className="text-foreground font-normal">{c.volume.toFixed(2)}</b>

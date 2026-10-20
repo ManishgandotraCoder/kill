@@ -9,7 +9,12 @@
 // A pattern key adds the trend into its first candle: "↓|DL Usv" = after a decline,
 // a big red candle then a small green candle with a long lower wick.
 
-import type { OHLC } from "./patterns";
+export interface OHLC {
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+}
 
 const AVG = 20;
 const TREND = 6;
